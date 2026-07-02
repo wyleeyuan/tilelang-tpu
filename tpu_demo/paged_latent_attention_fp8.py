@@ -24,9 +24,128 @@ T.copy = T.ppl_copy
 _KERNEL_ENV_LOCK = threading.Lock()
 
 
-def _bind_unique_so(kernel, name: str):
+def _patch_generated_head_multicore(loop_var: str, head_count: int, block_num: int) -> None:
+    """Patch the just-generated TPU kernel to split one head loop by block."""
+    kernel_dir = os.environ["TPU_KERNEL_PATH"]
+    kernel_c = os.path.join(kernel_dir, "kernel.c")
+    kernel_cpp = os.path.join(kernel_dir, "kernel.cpp")
+
+    with open(kernel_c, "r") as f:
+        c_src = f.read()
+    loop = f"for (int {loop_var} = 0; {loop_var} < {head_count}; ++{loop_var}) {{"
+    patched_loop = (
+        f"int __pla_block_num = tpu_core_num();\n"
+        f"  if (__pla_block_num > {block_num}) {{\n"
+        f"    __pla_block_num = {block_num};\n"
+        f"  }}\n"
+        f"  int __pla_block_idx = tpu_core_index();\n"
+        f"  if (__pla_block_idx >= __pla_block_num) {{\n"
+        f"    return;\n"
+        f"  }}\n"
+        f"  int __pla_h_per_block = ({head_count} + __pla_block_num - 1) / __pla_block_num;\n"
+        f"  int __pla_h_begin = __pla_block_idx * __pla_h_per_block;\n"
+        f"  int __pla_h_end = MIN(__pla_h_begin + __pla_h_per_block, {head_count});\n"
+        f"  for (int {loop_var} = __pla_h_begin; {loop_var} < __pla_h_end; ++{loop_var}) {{"
+    )
+    if loop not in c_src:
+        raise RuntimeError(f"expected generated head loop not found: {loop}")
+    c_src = c_src.replace(loop, patched_loop, 1)
+    with open(kernel_c, "w") as f:
+        f.write(c_src)
+
+    with open(kernel_cpp, "r") as f:
+        cpp_src = f.read()
+    cpp_src = cpp_src.replace("int core_num = 1;", f"int core_num = {block_num};", 1)
+    cpp_src = cpp_src.replace("int block_num = 1;", "int block_num = core_num;", 1)
+    with open(kernel_cpp, "w") as f:
+        f.write(cpp_src)
+
+
+def _patch_generated_attention_multicore(head_count: int, block_num: int) -> None:
+    """Patch the attention kernel: core0 updates cache, all cores split heads."""
+    kernel_dir = os.environ["TPU_KERNEL_PATH"]
+    kernel_c = os.path.join(kernel_dir, "kernel.c")
+    kernel_cpp = os.path.join(kernel_dir, "kernel.cpp")
+
+    with open(kernel_c, "r") as f:
+        c_src = f.read()
+
+    loop = f"for (int by = 0; by < {head_count}; ++by) {{"
+    patched_loop = (
+        f"int __pla_block_num = tpu_core_num();\n"
+        f"  if (__pla_block_num > {block_num}) {{\n"
+        f"    __pla_block_num = {block_num};\n"
+        f"  }}\n"
+        f"  int __pla_block_idx = tpu_core_index();\n"
+        f"  if (__pla_block_idx >= __pla_block_num) {{\n"
+        f"    return;\n"
+        f"  }}\n"
+        f"  int __pla_h_per_block = ({head_count} + __pla_block_num - 1) / __pla_block_num;\n"
+        f"  int __pla_h_begin = __pla_block_idx * __pla_h_per_block;\n"
+        f"  int __pla_h_end = MIN(__pla_h_begin + __pla_h_per_block, {head_count});\n"
+        f"  for (int by = __pla_h_begin; by < __pla_h_end; ++by) {{"
+    )
+    if loop not in c_src:
+        raise RuntimeError(f"expected generated attention head loop not found: {loop}")
+    c_src = c_src.replace(loop, patched_loop, 1)
+
+    cache_start = "    __ppl_tensor_info pe_new = "
+    cache_end = (
+        "    {\n"
+        "    dim4 __gather_block_shape = {1, 1, 2, 1024};\n"
+        "    tpu_gdma_h_gather_S2S(v30.addr, v22.addr, v27.addr, false, (scalar_t){.u32 = 0}, &__gather_block_shape, 2, NULL, NULL, NULL, DT_BFP16);\n"
+        "    }\n"
+    )
+    start = c_src.find(cache_start)
+    end = c_src.find(cache_end, start)
+    if start < 0 or end < 0:
+        raise RuntimeError("expected attention cache/gather block not found")
+    end += len(cache_end)
+    cache_block = c_src[start:end]
+    guarded = (
+        "    if (__pla_block_idx == 0 && by == __pla_h_begin) {\n"
+        + "".join("  " + line if line.strip() else line for line in cache_block.splitlines(True))
+        + "    }\n"
+        + "    if (by == __pla_h_begin) {\n"
+        + "      tpu_sync_core();\n"
+        + "    }\n"
+    )
+    c_src = c_src[:start] + guarded + c_src[end:]
+
+    output_store = (
+        "    tpu_gdma_cpy_L2S(output.addr, out_s_2.addr, &output.shape, "
+        "(output.default_stride ? NULL : &output.stride), "
+        "(out_s_2.default_stride ? NULL : &out_s_2.stride), DT_BFP16);\n"
+    )
+    if output_store not in c_src:
+        raise RuntimeError("expected attention output store not found")
+    with open(kernel_c, "w") as f:
+        f.write(c_src)
+
+    with open(kernel_cpp, "r") as f:
+        cpp_src = f.read()
+    cpp_src = cpp_src.replace("int core_num = 1;", f"int core_num = {block_num};", 1)
+    cpp_src = cpp_src.replace("int block_num = 1;", "int block_num = core_num;", 1)
+    with open(kernel_cpp, "w") as f:
+        f.write(cpp_src)
+
+
+def _rebuild_current_tpu_artifacts() -> None:
+    from tilelang.jit.adapter.libgen import LibraryGenerator
+
+    target = tilelang.tvm.target.Target("tpu")
+    LibraryGenerator(target).compile_lib(timeout=180)
+
+
+def _bind_unique_so(kernel, name: str, multicore_head_loop: tuple[str, int, int] | None = None, multicore_attention: tuple[int, int] | None = None):
     """Bind matching host and device libraries for one compiled TPU kernel."""
     kernel_dir = os.environ["TPU_KERNEL_PATH"]
+    if multicore_head_loop is not None:
+        _patch_generated_head_multicore(*multicore_head_loop)
+        _rebuild_current_tpu_artifacts()
+    if multicore_attention is not None:
+        _patch_generated_attention_multicore(*multicore_attention)
+        _rebuild_current_tpu_artifacts()
     host_source = os.path.join(kernel_dir, "main.so")
     host_target = os.path.join(kernel_dir, f"main_{name}.so")
     device_source = os.path.join(kernel_dir, "libkernel.so")
@@ -528,7 +647,8 @@ class PagedLatentAttentionFp8:
             wuq_projection_kernel(config.q_lora_rank, q_out_features),
             out_idx=[3],
             target="tpu",
-        ), f"pla_wuq_projection_{suffix}")
+        ), f"pla_wuq_projection_mc8_{suffix}",
+            multicore_head_loop=("ob", q_out_features // config.quant_block_size, 8))
         self.absorb_kernel = _bind_unique_so(tilelang.compile(
             latent_absorb_kernel(
                 config.num_heads,
@@ -540,7 +660,8 @@ class PagedLatentAttentionFp8:
             ),
             out_idx=[3, 4],
             target="tpu",
-        ), f"pla_absorb_{suffix}")
+        ), f"pla_absorb_mc8_{suffix}",
+            multicore_head_loop=("h", config.num_heads, 8))
         self.wuv_kernel = _bind_unique_so(tilelang.compile(
             wuv_projection_kernel(
                 config.num_heads,
@@ -550,7 +671,8 @@ class PagedLatentAttentionFp8:
             ),
             out_idx=[3],
             target="tpu",
-        ), f"pla_wuv_{suffix}")
+        ), f"pla_wuv_mc8_{suffix}",
+            multicore_head_loop=("h", config.num_heads, 8))
         # The TPU build directory has process-global artifacts. Rebuild the
         # attention kernel last so its first launch cannot observe WUV's
         # just-generated device image.
@@ -563,7 +685,8 @@ class PagedLatentAttentionFp8:
             ),
             out_idx=[4, 5, 12, 13, 14, 15],
             target="tpu",
-        ), f"pla_attention_{suffix}")
+        ), f"pla_attention_mc8_{suffix}",
+            multicore_attention=(config.num_heads, 8))
 
         self._scale_cache_key = None
         self._wuq_scale_expanded = None
