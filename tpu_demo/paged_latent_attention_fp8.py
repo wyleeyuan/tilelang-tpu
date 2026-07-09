@@ -130,6 +130,68 @@ def _patch_generated_attention_multicore(head_count: int, block_num: int) -> Non
         f.write(cpp_src)
 
 
+def _patch_generated_fused_multicore(head_count: int, block_num: int) -> None:
+    """Patch fused kernel: split heads, run cache update/gather once."""
+    kernel_dir = os.environ["TPU_KERNEL_PATH"]
+    kernel_c = os.path.join(kernel_dir, "kernel.c")
+    kernel_cpp = os.path.join(kernel_dir, "kernel.cpp")
+
+    with open(kernel_c, "r") as f:
+        c_src = f.read()
+
+    loop = f"for (int by = 0; by < {head_count}; ++by) {{"
+    patched_loop = (
+        f"int __pla_block_num = tpu_core_num();\n"
+        f"  if (__pla_block_num > {block_num}) {{\n"
+        f"    __pla_block_num = {block_num};\n"
+        f"  }}\n"
+        f"  int __pla_block_idx = tpu_core_index();\n"
+        f"  if (__pla_block_idx >= __pla_block_num) {{\n"
+        f"    return;\n"
+        f"  }}\n"
+        f"  int __pla_h_per_block = ({head_count} + __pla_block_num - 1) / __pla_block_num;\n"
+        f"  int __pla_h_begin = __pla_block_idx * __pla_h_per_block;\n"
+        f"  int __pla_h_end = MIN(__pla_h_begin + __pla_h_per_block, {head_count});\n"
+        f"  for (int by = __pla_h_begin; by < __pla_h_end; ++by) {{"
+    )
+    if loop not in c_src:
+        raise RuntimeError(f"expected generated fused head loop not found: {loop}")
+    c_src = c_src.replace(loop, patched_loop, 1)
+
+    cache_start = "    tpu_gdma_cpy_L2S(pe_new_rope.addr, "
+    cache_end = (
+        "    {\n"
+        "    dim4 __gather_block_shape = {1, 1, 2, 1024};\n"
+        "    tpu_gdma_h_gather_S2S(v32.addr, v24.addr, v29.addr, false, (scalar_t){.u32 = 0}, &__gather_block_shape, 2, NULL, NULL, NULL, DT_BFP16);\n"
+        "    }\n"
+    )
+    start = c_src.find(cache_start)
+    end = c_src.find(cache_end, start)
+    if start < 0 or end < 0:
+        raise RuntimeError("expected fused cache/gather block not found")
+    end += len(cache_end)
+    cache_block = c_src[start:end]
+    guarded = (
+        "    if (__pla_block_idx == 0 && by == __pla_h_begin) {\n"
+        + "".join("  " + line if line.strip() else line for line in cache_block.splitlines(True))
+        + "    }\n"
+        + "    if (by == __pla_h_begin) {\n"
+        + "      tpu_sync_core();\n"
+        + "    }\n"
+    )
+    c_src = c_src[:start] + guarded + c_src[end:]
+
+    with open(kernel_c, "w") as f:
+        f.write(c_src)
+
+    with open(kernel_cpp, "r") as f:
+        cpp_src = f.read()
+    cpp_src = cpp_src.replace("int core_num = 1;", f"int core_num = {block_num};", 1)
+    cpp_src = cpp_src.replace("int block_num = 1;", "int block_num = core_num;", 1)
+    with open(kernel_cpp, "w") as f:
+        f.write(cpp_src)
+
+
 def _rebuild_current_tpu_artifacts() -> None:
     from tilelang.jit.adapter.libgen import LibraryGenerator
 
@@ -137,7 +199,7 @@ def _rebuild_current_tpu_artifacts() -> None:
     LibraryGenerator(target).compile_lib(timeout=180)
 
 
-def _bind_unique_so(kernel, name: str, multicore_head_loop: tuple[str, int, int] | None = None, multicore_attention: tuple[int, int] | None = None):
+def _bind_unique_so(kernel, name: str, multicore_head_loop: tuple[str, int, int] | None = None, multicore_attention: tuple[int, int] | None = None, multicore_fused: tuple[int, int] | None = None):
     """Bind matching host and device libraries for one compiled TPU kernel."""
     kernel_dir = os.environ["TPU_KERNEL_PATH"]
     if multicore_head_loop is not None:
@@ -145,6 +207,9 @@ def _bind_unique_so(kernel, name: str, multicore_head_loop: tuple[str, int, int]
         _rebuild_current_tpu_artifacts()
     if multicore_attention is not None:
         _patch_generated_attention_multicore(*multicore_attention)
+        _rebuild_current_tpu_artifacts()
+    if multicore_fused is not None:
+        _patch_generated_fused_multicore(*multicore_fused)
         _rebuild_current_tpu_artifacts()
     host_source = os.path.join(kernel_dir, "main.so")
     host_target = os.path.join(kernel_dir, f"main_{name}.so")
@@ -304,7 +369,6 @@ def paged_latent_attention_fp8_kernel(
                 T.copy(max_v, max_prev)
                 T.ppl_fill(max_v, -T.infinity(accum_dtype))
                 T.ppl_reduce_max(score, max_v, dim=1, clear=False)
-
                 prev_scaled = T.alloc_shared([valid_block_h, 1], accum_dtype)
                 curr_scaled = T.alloc_shared([valid_block_h, 1], accum_dtype)
                 T.ppl_mul_C(prev_scaled, max_prev, scale)
@@ -600,6 +664,288 @@ def wuv_projection_kernel(
     return main_kernel_inner
 
 
+def paged_latent_attention_fp8_fused_kernel(
+    heads: int,
+    total_rows: int,
+    seqlen_kv: int,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    nope_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    block_size: int = 128,
+    block_n: int = 32,
+    paged_block_size: int = 16,
+    score_scale: float | None = None,
+):
+    """Fuse WUQ, absorb, paged attention, and WUV into one TPU kernel."""
+    assert nope_dim == block_size
+    assert value_dim == block_size
+    assert q_lora_rank % block_size == 0
+    assert kv_lora_rank % block_size == 0
+    assert total_rows % paged_block_size == 0
+    assert seqlen_kv % paged_block_size == 0
+    assert seqlen_kv % block_n == 0
+    q_head_dim = nope_dim + rope_dim
+    wukv_head_dim = nope_dim + value_dim
+    q_in_blocks = q_lora_rank // block_size
+    kv_in_blocks = kv_lora_rank // block_size
+    q_out_features = heads * q_head_dim
+    wukv_out_features = heads * wukv_head_dim
+    physical_blocks = total_rows // paged_block_size
+    logical_blocks = seqlen_kv // paged_block_size
+    scale = ((kv_lora_rank + rope_dim) ** -0.5
+             if score_scale is None else float(score_scale))
+    fp8_dtype = "e4m3_float8"
+    dtype = "bfloat16"
+    accum_dtype = "float"
+    neg_one = T.Cast(dtype, -1.0)
+
+    @T.prim_func
+    def main_kernel_inner(
+        query: T.Tensor([1, q_lora_rank], dtype),
+        wuq: T.Tensor([q_out_features, q_lora_rank], fp8_dtype),
+        wuq_scale_expanded: T.Tensor([q_out_features, q_in_blocks], dtype),
+        wukv: T.Tensor([wukv_out_features, kv_lora_rank], fp8_dtype),
+        wukv_scale_expanded: T.Tensor([wukv_out_features, kv_in_blocks], dtype),
+        kv_cache: T.Tensor([total_rows, kv_lora_rank], dtype),
+        pe_cache: T.Tensor([total_rows, rope_dim], dtype),
+        kv_new: T.Tensor([1, kv_lora_rank], dtype),
+        pe_new: T.Tensor([1, rope_dim], dtype),
+        cos: T.Tensor([1, rope_dim], dtype),
+        sin: T.Tensor([1, rope_dim], dtype),
+        block_table: T.Tensor([logical_blocks, 1], "uint32"),
+        save_slots: T.Tensor([1, 1], "uint32"),
+        kv_gather: T.Tensor([seqlen_kv, kv_lora_rank], dtype),
+        pe_gather: T.Tensor([seqlen_kv, rope_dim], dtype),
+        pe_new_rope: T.Tensor([1, rope_dim], dtype),
+        output: T.Tensor([1, heads, 1, value_dim], dtype),
+    ):
+        with T.Kernel(1, heads, is_cpu=True) as (_, by):
+            k_src = T.alloc_shared([1, rope_dim], dtype)
+            k_cos_s = T.alloc_shared([1, rope_dim], dtype)
+            k_sin_s = T.alloc_shared([1, rope_dim], dtype)
+            k_x_cos = T.alloc_shared([1, rope_dim], dtype)
+            k_x_sin = T.alloc_shared([1, rope_dim], dtype)
+            k_neg = T.alloc_shared([1, rope_dim], dtype)
+            k_neg_sin = T.alloc_shared([1, rope_dim], dtype)
+            k_rotated = T.alloc_shared([1, rope_dim], dtype)
+            T.copy(pe_new, k_src)
+            T.copy(cos, k_cos_s)
+            T.copy(sin, k_sin_s)
+            T.ppl_mul(k_x_cos, k_src, k_cos_s)
+            T.ppl_mul(k_x_sin, k_src, k_sin_s)
+            T.ppl_mul_C(k_neg, k_src, neg_one)
+            T.ppl_mul(k_neg_sin, k_neg, k_sin_s)
+            T.ppl_rope_add(k_rotated, k_x_cos, k_neg_sin, k_x_cos, k_x_sin)
+            T.copy(k_rotated, pe_new_rope)
+
+            T.ppl_scatter(kv_cache, kv_new, save_slots, 1)
+            T.ppl_scatter(pe_cache, pe_new_rope, save_slots, 1)
+            T.ppl_gather_block(kv_gather, kv_cache, block_table,
+                               physical_blocks, logical_blocks,
+                               paged_block_size * kv_lora_rank)
+            T.ppl_gather_block(pe_gather, pe_cache, block_table,
+                               physical_blocks, logical_blocks,
+                               paged_block_size * rope_dim)
+
+            q_nope = T.alloc_shared([1, nope_dim], dtype)
+            q_rope = T.alloc_shared([1, rope_dim], dtype)
+            q_nope_acc = T.alloc_shared([1, nope_dim], accum_dtype)
+            q_rope_acc = T.alloc_shared([1, rope_dim], accum_dtype)
+            q_abs = T.alloc_shared([1, kv_lora_rank], dtype)
+            T.ppl_clear(q_nope_acc)
+            T.ppl_clear(q_rope_acc)
+
+            for ib in T.serial(q_in_blocks):
+                query_shared = T.alloc_shared([1, block_size], dtype)
+                weight_nope_fp8 = T.alloc_shared([nope_dim, block_size], fp8_dtype)
+                weight_nope_bf16 = T.alloc_shared([nope_dim, block_size], dtype)
+                scale_nope = T.alloc_shared([nope_dim, 1], dtype)
+                weight_nope = T.alloc_shared([nope_dim, block_size], dtype)
+                partial_nope = T.alloc_shared([1, nope_dim], accum_dtype)
+                weight_rope_fp8 = T.alloc_shared([rope_dim, block_size], fp8_dtype)
+                weight_rope_bf16 = T.alloc_shared([rope_dim, block_size], dtype)
+                scale_rope = T.alloc_shared([rope_dim, 1], dtype)
+                weight_rope = T.alloc_shared([rope_dim, block_size], dtype)
+                partial_rope = T.alloc_shared([1, rope_dim], accum_dtype)
+                T.copy(query[:, ib * block_size:(ib + 1) * block_size],
+                       query_shared)
+                T.copy(
+                    wuq[
+                        by * q_head_dim:by * q_head_dim + nope_dim,
+                        ib * block_size:(ib + 1) * block_size,
+                    ],
+                    weight_nope_fp8,
+                )
+                T.copy(weight_nope_fp8, weight_nope_bf16)
+                T.copy(
+                    wuq_scale_expanded[
+                        by * q_head_dim:by * q_head_dim + nope_dim,
+                        ib:ib + 1,
+                    ],
+                    scale_nope,
+                )
+                T.ppl_mul(weight_nope, weight_nope_bf16, scale_nope)
+                T.ppl_clear(partial_nope)
+                T.ppl_gemm(query_shared, weight_nope, partial_nope,
+                           transpose_B=True)
+                T.ppl_add(q_nope_acc, q_nope_acc, partial_nope)
+
+                T.copy(
+                    wuq[
+                        by * q_head_dim + nope_dim:(by + 1) * q_head_dim,
+                        ib * block_size:(ib + 1) * block_size,
+                    ],
+                    weight_rope_fp8,
+                )
+                T.copy(weight_rope_fp8, weight_rope_bf16)
+                T.copy(
+                    wuq_scale_expanded[
+                        by * q_head_dim + nope_dim:(by + 1) * q_head_dim,
+                        ib:ib + 1,
+                    ],
+                    scale_rope,
+                )
+                T.ppl_mul(weight_rope, weight_rope_bf16, scale_rope)
+                T.ppl_clear(partial_rope)
+                T.ppl_gemm(query_shared, weight_rope, partial_rope,
+                           transpose_B=True)
+                T.ppl_add(q_rope_acc, q_rope_acc, partial_rope)
+
+            T.copy(q_nope_acc, q_nope)
+            T.copy(q_rope_acc, q_rope)
+
+            for ib in T.serial(kv_in_blocks):
+                weight_fp8 = T.alloc_shared([block_size, block_size], fp8_dtype)
+                weight_bf16 = T.alloc_shared([block_size, block_size], dtype)
+                scale_rows = T.alloc_shared([block_size, 1], dtype)
+                weight_dequant = T.alloc_shared([block_size, block_size], dtype)
+                acc = T.alloc_shared([1, block_size], accum_dtype)
+                out_shared = T.alloc_shared([1, block_size], dtype)
+                T.copy(
+                    wukv[
+                        by * wukv_head_dim:by * wukv_head_dim + block_size,
+                        ib * block_size:(ib + 1) * block_size,
+                    ],
+                    weight_fp8,
+                )
+                T.copy(weight_fp8, weight_bf16)
+                T.copy(
+                    wukv_scale_expanded[
+                        by * wukv_head_dim:by * wukv_head_dim + block_size,
+                        ib:ib + 1,
+                    ],
+                    scale_rows,
+                )
+                T.ppl_mul(weight_dequant, weight_bf16, scale_rows)
+                T.ppl_clear(acc)
+                T.ppl_gemm(q_nope, weight_dequant, acc)
+                T.copy(acc, out_shared)
+                T.copy(out_shared, q_abs[:, ib * block_size:(ib + 1) * block_size])
+
+            q_x_cos = T.alloc_shared([1, rope_dim], dtype)
+            q_x_sin = T.alloc_shared([1, rope_dim], dtype)
+            q_neg = T.alloc_shared([1, rope_dim], dtype)
+            q_neg_sin = T.alloc_shared([1, rope_dim], dtype)
+            q_pe = T.alloc_shared([1, rope_dim], dtype)
+            T.ppl_mul(q_x_cos, q_rope, k_cos_s)
+            T.ppl_mul(q_x_sin, q_rope, k_sin_s)
+            T.ppl_mul_C(q_neg, q_rope, neg_one)
+            T.ppl_mul(q_neg_sin, q_neg, k_sin_s)
+            T.ppl_rope_add(q_pe, q_x_cos, q_neg_sin, q_x_cos, q_x_sin)
+
+            kv_s = T.alloc_shared([block_n, kv_lora_rank], dtype)
+            pe_s = T.alloc_shared([block_n, rope_dim], dtype)
+            prob_s = T.alloc_shared([1, block_n], dtype)
+            score = T.alloc_shared([1, block_n], accum_dtype)
+            score_pe = T.alloc_shared([1, block_n], accum_dtype)
+            acc_o = T.alloc_shared([1, kv_lora_rank], accum_dtype)
+            max_v = T.alloc_shared([1, 1], accum_dtype)
+            max_prev = T.alloc_shared([1, 1], accum_dtype)
+            rescale = T.alloc_shared([1, 1], accum_dtype)
+            score_sum = T.alloc_shared([1, 1], accum_dtype)
+            logsum = T.alloc_shared([1, 1], accum_dtype)
+            T.ppl_fill(acc_o, T.float32(0))
+            T.ppl_fill(logsum, T.float32(0))
+            T.ppl_fill(max_v, -T.infinity(accum_dtype))
+
+            for k in T.Pipelined(seqlen_kv // block_n, num_stages=2):
+                T.copy(kv_gather[k * block_n:(k + 1) * block_n, :], kv_s)
+                T.copy(pe_gather[k * block_n:(k + 1) * block_n, :], pe_s)
+                T.ppl_clear(score)
+                T.ppl_gemm(q_abs, kv_s, score, transpose_B=True)
+                T.ppl_clear(score_pe)
+                T.ppl_gemm(q_pe, pe_s, score_pe, transpose_B=True)
+                T.ppl_add(score, score, score_pe)
+                T.copy(max_v, max_prev)
+                T.ppl_fill(max_v, -T.infinity(accum_dtype))
+                T.ppl_reduce_max(score, max_v, dim=1, clear=False)
+                prev_scaled = T.alloc_shared([1, 1], accum_dtype)
+                curr_scaled = T.alloc_shared([1, 1], accum_dtype)
+                T.ppl_mul_C(prev_scaled, max_prev, scale)
+                T.ppl_mul_C(curr_scaled, max_v, scale)
+                T.ppl_subtract(rescale, prev_scaled, curr_scaled)
+                work0 = T.alloc_shared([1, 1], accum_dtype)
+                work1 = T.alloc_shared([1, 1], accum_dtype)
+                coeff = T.alloc_shared([64, 32], accum_dtype)
+                table = T.alloc_shared([64, 192], accum_dtype)
+                T.ppl_exp2(rescale, work0, work1, coeff, table)
+
+                max_scaled = T.alloc_shared([1, 1], accum_dtype)
+                T.ppl_mul_C(score, score, scale)
+                T.ppl_mul_C(max_scaled, max_v, scale)
+                T.ppl_subtract(score, score, max_scaled)
+                work2 = T.alloc_shared([1, block_n], accum_dtype)
+                work3 = T.alloc_shared([1, block_n], accum_dtype)
+                T.ppl_exp2(score, work2, work3, coeff, table)
+                T.ppl_reduce_sum(score, score_sum, dim=1)
+                T.copy(score, prob_s)
+                T.ppl_mul(logsum, logsum, rescale)
+                T.ppl_add(logsum, logsum, score_sum)
+                T.ppl_mul(acc_o, acc_o, rescale)
+                T.ppl_gemm(prob_s, kv_s, acc_o)
+
+            T.ppl_div(acc_o, acc_o, logsum)
+
+            value_acc = T.alloc_shared([1, value_dim], accum_dtype)
+            value_out = T.alloc_shared([1, value_dim], dtype)
+            T.ppl_clear(value_acc)
+            for ib in T.serial(kv_in_blocks):
+                latent_shared = T.alloc_shared([1, block_size], dtype)
+                weight_fp8 = T.alloc_shared([block_size, block_size], fp8_dtype)
+                weight_bf16 = T.alloc_shared([block_size, block_size], dtype)
+                scale_rows = T.alloc_shared([block_size, 1], dtype)
+                weight_dequant = T.alloc_shared([block_size, block_size], dtype)
+                partial = T.alloc_shared([1, value_dim], accum_dtype)
+                T.copy(acc_o[:, ib * block_size:(ib + 1) * block_size],
+                       latent_shared)
+                T.copy(
+                    wukv[
+                        by * wukv_head_dim + nope_dim:(by + 1) * wukv_head_dim,
+                        ib * block_size:(ib + 1) * block_size,
+                    ],
+                    weight_fp8,
+                )
+                T.copy(weight_fp8, weight_bf16)
+                T.copy(
+                    wukv_scale_expanded[
+                        by * wukv_head_dim + nope_dim:(by + 1) * wukv_head_dim,
+                        ib:ib + 1,
+                    ],
+                    scale_rows,
+                )
+                T.ppl_mul(weight_dequant, weight_bf16, scale_rows)
+                T.ppl_clear(partial)
+                T.ppl_gemm(latent_shared, weight_dequant, partial,
+                           transpose_B=True)
+                T.ppl_add(value_acc, value_acc, partial)
+            T.copy(value_acc, value_out)
+            T.copy(value_out, output[:, by:by + 1, :, :])
+
+    return main_kernel_inner
+
+
 def dequant_block_weight(weight: torch.Tensor, scale: torch.Tensor,
                          block_size: int) -> torch.Tensor:
     """Dequantize one rank-2 FP8 linear weight with block scales."""
@@ -643,50 +989,24 @@ class PagedLatentAttentionFp8:
             f"kr{config.kv_lora_rank}"
         )
 
-        self.wuq_projection_kernel = _bind_unique_so(tilelang.compile(
-            wuq_projection_kernel(config.q_lora_rank, q_out_features),
-            out_idx=[3],
-            target="tpu",
-        ), f"pla_wuq_projection_mc8_{suffix}",
-            multicore_head_loop=("ob", q_out_features // config.quant_block_size, 8))
-        self.absorb_kernel = _bind_unique_so(tilelang.compile(
-            latent_absorb_kernel(
+        self.kernel = _bind_unique_so(tilelang.compile(
+            paged_latent_attention_fp8_fused_kernel(
                 config.num_heads,
+                total_cache_rows,
+                self.context_rows,
                 config.q_lora_rank,
                 config.kv_lora_rank,
                 config.qk_nope_head_dim,
                 config.qk_rope_head_dim,
                 config.value_head_dim,
-            ),
-            out_idx=[3, 4],
-            target="tpu",
-        ), f"pla_absorb_mc8_{suffix}",
-            multicore_head_loop=("h", config.num_heads, 8))
-        self.wuv_kernel = _bind_unique_so(tilelang.compile(
-            wuv_projection_kernel(
-                config.num_heads,
-                config.kv_lora_rank,
-                config.qk_nope_head_dim,
-                config.value_head_dim,
-            ),
-            out_idx=[3],
-            target="tpu",
-        ), f"pla_wuv_mc8_{suffix}",
-            multicore_head_loop=("h", config.num_heads, 8))
-        # The TPU build directory has process-global artifacts. Rebuild the
-        # attention kernel last so its first launch cannot observe WUV's
-        # just-generated device image.
-        self.kernel = _bind_unique_so(tilelang.compile(
-            paged_latent_attention_fp8_kernel(
-                1, config.num_heads, total_cache_rows, self.context_rows,
-                config.kv_lora_rank, config.qk_rope_head_dim,
+                block_size=config.quant_block_size,
                 paged_block_size=config.paged_cache_block_size,
                 score_scale=config.softmax_scale,
             ),
-            out_idx=[4, 5, 12, 13, 14, 15],
+            out_idx=[5, 6, 13, 14, 15, 16],
             target="tpu",
-        ), f"pla_attention_mc8_{suffix}",
-            multicore_attention=(config.num_heads, 8))
+        ), f"pla_fused_mc8_{suffix}",
+            multicore_fused=(config.num_heads, 8))
 
         self._scale_cache_key = None
         self._wuq_scale_expanded = None
@@ -788,51 +1108,32 @@ class PagedLatentAttentionFp8:
         wuq_scale_expanded, wukv_scale_expanded = self._prepare_scales(
             wuq, wukv, wuq_scale, wukv_scale
         )
-        q_out_features = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        q_full = torch.empty(1, q_out_features, dtype=torch.bfloat16)
-        ret = self.wuq_projection_kernel(
-            query.reshape(1, q_lora_rank).contiguous(),
-            wuq,
-            wuq_scale_expanded,
-            q_full,
-        )
-        self._check_kernel_return("WUQ projection", ret)
-
-        q_abs = torch.empty(
-            1, num_heads, 1, kv_lora_rank, dtype=torch.bfloat16
-        )
-        q_rope = torch.empty(
-            1, num_heads, 1, qk_rope_head_dim, dtype=torch.bfloat16
-        )
-        ret = self.absorb_kernel(
-            q_full, wukv, wukv_scale_expanded, q_abs, q_rope
-        )
-        self._check_kernel_return("latent absorption", ret)
-
-        q_cos = cos.reshape(1, 1, 1, qk_rope_head_dim).expand_as(q_rope).contiguous().to(torch.bfloat16)
-        q_sin = sin.reshape(1, 1, 1, qk_rope_head_dim).expand_as(q_rope).contiguous().to(torch.bfloat16)
         kv_flat = kv_cache.reshape(self.total_cache_rows, kv_lora_rank)
         pe_flat = pe_cache.reshape(self.total_cache_rows, qk_rope_head_dim)
         kv_gather = torch.empty(self.context_rows, kv_lora_rank, dtype=torch.bfloat16)
         pe_gather = torch.empty(self.context_rows, qk_rope_head_dim, dtype=torch.bfloat16)
         pe_rotated = torch.empty(1, qk_rope_head_dim, dtype=torch.bfloat16)
-        latent_out = torch.empty(1, num_heads, 1, kv_lora_rank, dtype=torch.bfloat16)
+        value = out.reshape(1, num_heads, 1, value_head_dim)
         ret = self.kernel(
-            q_abs, q_rope, q_cos, q_sin, kv_flat, pe_flat,
+            query.reshape(1, q_lora_rank).contiguous(),
+            wuq,
+            wuq_scale_expanded,
+            wukv,
+            wukv_scale_expanded,
+            kv_flat,
+            pe_flat,
             kv_latent.reshape(1, kv_lora_rank).contiguous(),
             key_pe.reshape(1, qk_rope_head_dim).contiguous(),
             cos.reshape(1, qk_rope_head_dim).contiguous(),
             sin.reshape(1, qk_rope_head_dim).contiguous(),
             block_tables.reshape(-1, 1).contiguous().view(torch.uint32),
             save_slots.reshape(1, 1).contiguous().view(torch.uint32),
-            kv_gather, pe_gather, pe_rotated, latent_out,
+            kv_gather,
+            pe_gather,
+            pe_rotated,
+            value,
         )
-        self._check_kernel_return("paged latent attention", ret)
-        value = out.reshape(1, num_heads, 1, value_head_dim)
-        ret = self.wuv_kernel(
-            latent_out, wukv, wukv_scale_expanded, value
-        )
-        self._check_kernel_return("WUV projection", ret)
+        self._check_kernel_return("fused paged latent attention", ret)
         return out
 
 
@@ -870,6 +1171,7 @@ __all__ = [
     "fp8_block_dequant_kernel",
     "install_torch_custom_op",
     "latent_absorb_kernel",
+    "paged_latent_attention_fp8_fused_kernel",
     "paged_latent_attention_fp8_kernel",
     "wuq_projection_kernel",
     "wuv_projection_kernel",
